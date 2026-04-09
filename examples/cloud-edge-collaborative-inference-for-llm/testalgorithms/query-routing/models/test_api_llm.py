@@ -3,6 +3,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 MODELS_DIR = Path(__file__).resolve().parent
 
@@ -18,6 +19,14 @@ def load_module(name, path):
 models_pkg = types.ModuleType("models")
 models_pkg.__path__ = [str(MODELS_DIR)]
 sys.modules.setdefault("models", models_pkg)
+
+openai_pkg = types.ModuleType("openai")
+openai_pkg.OpenAI = object
+sys.modules.setdefault("openai", openai_pkg)
+
+groq_pkg = types.ModuleType("groq")
+groq_pkg.Groq = object
+sys.modules.setdefault("groq", groq_pkg)
 
 load_module("models.base_llm", MODELS_DIR / "base_llm.py")
 api_llm = load_module("models.api_llm", MODELS_DIR / "api_llm.py")
@@ -42,29 +51,32 @@ def build_api_error(status_code, error_type, message):
 
 
 class FakeCompletions:
-    def __init__(self, error):
-        self.error = error
+    def __init__(self, side_effects):
+        self.side_effects = list(side_effects)
+        self.calls = 0
 
     def create(self, **kwargs):
-        raise self.error
+        self.calls += 1
+        side_effect = self.side_effects[min(self.calls - 1, len(self.side_effects) - 1)]
+        raise side_effect
 
 
 class FakeChat:
-    def __init__(self, error):
-        self.completions = FakeCompletions(error)
+    def __init__(self, side_effects):
+        self.completions = FakeCompletions(side_effects)
 
 
 class FakeClient:
-    def __init__(self, error):
-        self.chat = FakeChat(error)
+    def __init__(self, side_effects):
+        self.chat = FakeChat(side_effects)
 
 
 class APIBasedLLMTests(unittest.TestCase):
     @staticmethod
-    def build_model(error):
+    def build_model(*side_effects):
         model = object.__new__(APIBasedLLM)
         model.provider = "openai"
-        model.client = FakeClient(error)
+        model.client = FakeClient(side_effects)
         model.model = "gpt-4o-mini"
         model.model_name = "gpt-4o-mini"
         model.temperature = 0.8
@@ -86,7 +98,8 @@ class APIBasedLLMTests(unittest.TestCase):
             )
         )
 
-        response = model.inference({"query": "unsafe prompt"})
+        with mock.patch.object(api_llm.time, "sleep", return_value=None):
+            response = model.inference({"query": "unsafe prompt"})
 
         self.assertEqual("", response["completion"])
         self.assertIsNone(response["prediction"])
@@ -95,6 +108,21 @@ class APIBasedLLMTests(unittest.TestCase):
             "content_policy_violation_error",
             response["error"]["type"],
         )
+        self.assertEqual(1, model.client.chat.completions.calls)
+
+    def test_retryable_failures_are_retried_before_returning_empty_prediction(self):
+        model = self.build_model(
+            build_api_error(503, "server_error", "Service temporarily unavailable."),
+        )
+
+        with mock.patch.object(api_llm.time, "sleep", return_value=None) as sleep_mock:
+            response = model.inference({"query": "retry me"})
+
+        self.assertEqual("", response["completion"])
+        self.assertIsNone(response["prediction"])
+        self.assertEqual(503, response["error"]["status_code"])
+        self.assertEqual(3, model.client.chat.completions.calls)
+        self.assertEqual(2, sleep_mock.call_count)
 
     def test_invalid_requests_still_fail_fast(self):
         model = self.build_model(
@@ -106,7 +134,10 @@ class APIBasedLLMTests(unittest.TestCase):
         )
 
         with self.assertRaises(RuntimeError):
-            model.inference({"query": "hello"})
+            with mock.patch.object(api_llm.time, "sleep", return_value=None):
+                model.inference({"query": "hello"})
+
+        self.assertEqual(1, model.client.chat.completions.calls)
 
 
 if __name__ == "__main__":
