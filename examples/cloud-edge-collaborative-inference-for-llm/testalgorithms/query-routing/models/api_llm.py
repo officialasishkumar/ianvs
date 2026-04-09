@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
 import time
 
@@ -19,6 +20,14 @@ from openai import OpenAI
 from groq import Groq
 from models.base_llm import BaseLLM
 from retry import retry
+
+LOGGER = logging.getLogger(__name__)
+RECOVERABLE_API_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504}
+CONTENT_FILTER_ERROR_TYPES = {
+    "content_policy_violation_error",
+    "content_filter",
+    "prompt_rejected",
+}
 
 class APIBasedLLM(BaseLLM):
     def __init__(self, **kwargs) -> None:
@@ -61,6 +70,37 @@ class APIBasedLLM(BaseLLM):
         """
 
         self.model = model
+
+    @staticmethod
+    def _extract_error_details(error):
+        """Extract provider error details in a sdk-agnostic format."""
+        status_code = getattr(error, "status_code", None)
+        body = getattr(error, "body", None)
+        error_payload = body.get("error", {}) if isinstance(body, dict) else {}
+        error_type = error_payload.get("type")
+        message = error_payload.get("message") or str(error)
+        return status_code, error_type, message
+
+    @classmethod
+    def _is_recoverable_api_error(cls, error):
+        """Return whether the provider error should fail only this sample."""
+        status_code, error_type, _ = cls._extract_error_details(error)
+
+        if status_code in RECOVERABLE_API_STATUS_CODES:
+            return True
+
+        return status_code == 400 and error_type in CONTENT_FILTER_ERROR_TYPES
+
+    def _build_error_response(self, error):
+        """Return an empty response so the benchmark can continue."""
+        status_code, error_type, message = self._extract_error_details(error)
+        response = self._format_response("", 0, 0, 0, 0, 0)
+        response["error"] = {
+            "status_code": status_code,
+            "type": error_type or error.__class__.__name__,
+            "message": message,
+        }
+        return response
 
     @retry(tries=3, delay=4, max_delay=10)
     def _infer(self, messages):
@@ -139,6 +179,17 @@ class APIBasedLLM(BaseLLM):
                 throughput = 0
 
         except Exception as e:
+            if self._is_recoverable_api_error(e):
+                status_code, error_type, message = self._extract_error_details(e)
+                LOGGER.warning(
+                    "Provider inference failed for one sample; returning empty response. "
+                    "provider=%s status=%s type=%s message=%s",
+                    self.provider,
+                    status_code,
+                    error_type,
+                    message,
+                )
+                return self._build_error_response(e)
             raise RuntimeError(f"Error during API inference: {e}")
 
         response = self._format_response(
